@@ -1,3 +1,6 @@
+# Generator for http://lambda.lt/m
+# martynasp@gmail.com | 2016
+
 BEGIN {
     state = 0 # '0' - new line, '1' - title, '2' - url, '3' - tags
     entry = ""
@@ -14,6 +17,8 @@ BEGIN {
     print "    li a { color: #fefefe; font-weight: bold; text-decoration: underline; }"
     print "    li a:hover { text-decoration: none; }"
     print "    span.tags { color: #81ceeb; }"
+    print "    #footer { color: #b0aeae; }"
+    print "    #footer a { color: #b0aeae; }"
     print "  </style>"
     print "</head>"
     print "<body>"
@@ -38,7 +43,12 @@ state != 0 && /^$/ { state = 0; }
 
 END {
     print "</ul>"
+    print "<div id=\"footer\">"
+    print "Generated with <a href=\"http://lambda.lt/m/music.awk\">music.awk</a>"
+    print " | "
+    print "Last Update: "
+    system("date")
+    print "</div>"
     print "</body>"
     print "</html>"
 }
-
