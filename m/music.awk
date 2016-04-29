@@ -44,7 +44,8 @@ state != 0 && /^$/ { state = 0; }
 END {
     print "</ul>"
     print "<div id=\"footer\">"
-    print "Generated with <a href=\"http://lambda.lt/m/music.awk\">music.awk</a>"
+    print "Generated with <a href=\"http://lambda.lt/m/music.awk\">music.awk</a>, "
+    print "input <a href=\"http://lambda.lt/m/music.txt\">music.txt</a> "
     print " | "
     print "Last Update: "
     system("date")
