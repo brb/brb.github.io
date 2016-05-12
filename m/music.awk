@@ -44,12 +44,12 @@ state != 0 && /^$/ { state = 0; }
 END {
     print "</ul>"
     print "<div id=\"footer\">"
-    print "Generated with <a href=\"http://lambda.lt/m/music.awk\">music.awk</a>, "
-    print "input <a href=\"http://lambda.lt/m/music.txt\">music.txt</a> "
-    print " | "
-    print "Last Update: "
+    print "$ awk -f <a href=\"http://lambda.lt/m/music.awk\">music.awk</a> "
+    print "<a href=\"http://lambda.lt/m/music.txt\">music.txt</a> "
+    print " # "
+    print "<i>Last Update: "
     system("date")
-    print "</div>"
+    print "</i></div>"
     print "</body>"
     print "</html>"
 }
