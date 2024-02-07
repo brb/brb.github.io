@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Martynas Pumputis Blog" />
+  <meta property="og:url" content="https://lambda.lt" />
+  <title>2018-08-16: Racy conntrack and DNS lookup timeouts</title>
+</head>
+<body>
+  <h1>2018-08-16: Racy conntrack and DNS lookup timeouts</h1>
+  <hr/>
+  <em>This blog post was originally published on <a href="https://www.weave.works/blog/racy-conntrack-and-dns-lookup-timeouts">weave.works</a></em>
+   <p>Recently there were many Kubernetes user bug reports about DNS lookups from Pods sometimes taking 5 or even more seconds: <a href="https://github.com/weaveworks/weave/issues/3287">weave#3287</a>, <a href="https://github.com/kubernetes/kubernetes/issues/56903">kubernetes#56903</a>.
+</p>
+<p>In this post, I will explain the root causes for such delays, discuss some mitigations and present the kernel fixes.
+</p>
+<h2>Background</h2>
+<p>In Kubernetes, the most common way for a Pod to access a DNS server (<code>kube-dns</code>) is via the <a href="https://kubernetes.io/docs/concepts/services-networking/service/">Service</a> abstraction. Therefore, before trying to explain the problem, it is important to understand how Service works, and consequently, how the Destination Network Address Translation (DNAT) is implemented in the Linux kernel.
+</p>
+<p>NOTE: all examples in this post are based on Kubernetes v1.11.0 and Linux kernel v4.17.
+</p>
+<h3>How Service works
+</h3>
+<p>In <code>iptables</code> mode, which is a default, <code>kube-proxy</code> for each Service creates a few iptables rules in the <code>nat</code> table of the host network namespace.
+</p>
+<p>Let's consider the <code>kube-dns</code> Service with two DNS server instances in a cluster. The relevant rules are the following:
+</p>
+<pre>(1) -A PREROUTING -m comment --comment "kubernetes service portals" -j KUBE-SERVICES
+&lt;...&gt;
+(2) -A KUBE-SERVICES -d 10.96.0.10/32 -p udp -m comment --comment "kube-system/kube-dns:dns cluster IP" -m udp --dport 53 -j KUBE-SVC-TCOU7JCQXEZGVUNU
+&lt;...&gt;
+(3) -A KUBE-SVC-TCOU7JCQXEZGVUNU -m comment --comment "kube-system/kube-dns:dns" -m statistic --mode random --probability 0.50000000000 -j KUBE-SEP-LLLB6FGXBLX6PZF7
+(4) -A KUBE-SVC-TCOU7JCQXEZGVUNU -m comment --comment "kube-system/kube-dns:dns" -j KUBE-SEP-LRVEW52VMYCOUSMZ
+&lt;...&gt;
+(5) -A KUBE-SEP-LLLB6FGXBLX6PZF7 -p udp -m comment --comment "kube-system/kube-dns:dns" -m udp -j DNAT --to-destination 10.32.0.6:53
+&lt;...&gt;
+(6) -A KUBE-SEP-LRVEW52VMYCOUSMZ -p udp -m comment --comment "kube-system/kube-dns:dns" -m udp -j DNAT --to-destination 10.32.0.7:53
+</pre>
+<p>In our example, each Pod has the <code>nameserver 10.96.0.10</code> entry populated in its <a href="https://linux.die.net/man/5/resolv.conf">/etc/resolv.conf.</a> Therefore, a DNS lookup request from a Pod is going to be sent to 10.96.0.10 which is a ClusterIP (a virtual IP) of the <code>kube-dns</code> Service.
+</p>
+<p>The request enters the <code>KUBE-SERVICE</code> chain due to (1), then matches the rule (2), and finally, depending on a random value of (3) either jumps to the (5) or (6) rule (a poor-man's load balancing) which modifies the destination IPv4 address of the request UDP packet to the "real" IPv4 address of the DNS server. This modification is done by DNAT.
+</p>
+<p>10.32.0.6 and 10.32.0.7 are IPv4 addresses of the Kubernetes DNS server containers in Weave Net network.
+</p>
+<h3>DNAT in Linux Kernel
+</h3>
+<p>As seen above, the foundation of Service (in the <code>iptables</code> mode) is DNAT which is performed by the kernel.
+</p>
+<p>The main responsibilities of DNAT are to change a destination of an outgoing packet, a source of a reply packet and at the same time, to ensure that the same modifications are applied to all subsequent packets.
+</p>
+<p>The latter heavily relies on the connection tracking mechanism also known as <code>conntrack</code> which is implemented as a kernel module. As the name suggests, <code>conntrack</code> keeps track of ongoing network connections in the system.
+</p>
+<p>In a simplified way, each connection in <code>conntrack</code> is represented with two tuples - one for the original request (<code>IP_CT_DIR_ORIGINAL</code>) and one for the reply (<code>IP_CT_DIR_REPLY</code>). In the case of UDP, each of the tuples consists of the source IP address, the source port, as well as the destination IP address and the destination port. The reply tuple contains the real address of a target stored in the <code>src</code> field.
+</p>
+<p>For example, if a Pod with the IP address 10.40.0.17 sends a request to the ClusterIP of <code>kube-dns</code> which gets translated to 10.32.0.6, the following tuples will be created:
+</p>
+<ul>
+	<li>Original: <code>src=10.40.0.17 dst=10.96.0.10 sport=53378 dport=53</code></li>
+	<li>Reply: <code>src=10.32.0.6 dst=10.40.0.17 sport=53 dport=53378</code></li>
+</ul>
+<p>By having these entries the kernel can modify the destination and source addresses of any related packets accordingly without the need to traverse the DNAT rules again. Also, it will know how to modify a reply and to whom it should be sent.
+</p>
+<p>When a <code>conntrack</code> entry is created, it is first unconfirmed. Later on, the kernel will try to confirm the entry if there is no confirmed <code>conntrack</code> entry with either the same original tuple or a reply tuple.
+</p>
+<p>A simplified flow of the <code>conntrack</code> creation and DNAT is shown below:
+</p>
+<pre>+---------------------------+      Create a conntrack for a given packet if
+|                           |      it does not exist; IP_CT_DIR_REPLY is
+|    1. <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/netfilter/nf_conntrack_core.c?h=v4.17#n1367">nf_conntrack_in</a>     |      an invert of IP_CT_DIR_ORIGINAL tuple, so
+|                           |      src of the reply tuple is not changed yet.
++------------+--------------+
+             |
+             v
++---------------------------+
+|                           |
+|     2. <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/netfilter/ip_tables.c?h=v4.17#n228">ipt_do_table</a>       |      Find a matching DNAT rule.
+|                           |
++------------+--------------+
+             |
+             v
++---------------------------+
+|                           |      Update the reply tuples src part according
+|    3. <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/netfilter/nf_nat_core.c?h=v4.17#n299">get_unique_tuple</a>    |      to the DNAT rule in a way that it is not used
+|                           |      by any already confirmed conntrack.
++------------+--------------+
+             |
+             v
++---------------------------+
+|                           |      Mangle the packet destination port and address
+|     4. <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/netfilter/nf_nat_core.c?h=v4.17#n478">nf_nat_packet</a>      |      according to the reply tuple.
+|                           |
++------------+--------------+
+             |
+             v
++----------------------------+
+|                            |     Confirm the conntrack if there is no confirmed
+|  5. <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/netfilter/nf_conntrack_core.c?h=v4.17#n722">__nf_conntrack_confirm</a> |     conntrack with either the same original or
+|                            |     a reply tuple; increment insert_failed counter
++----------------------------+     and drop the packet if it exists.
+</pre>
+<h2>Problem
+</h2>
+<p>A problem occurs when two UDP packets are sent via the same socket at the same time from different threads.
+</p>
+<p>UDP is a connection-less protocol, so no packet is sent as a result of the <a href="https://linux.die.net/man/2/connect">connect(2)</a> syscall (opposite to TCP) and thus, no <code>conntrack</code> entry has been created after the call.
+</p>
+<p>The entry is created only when a packet is sent. This leads to the following possible races:
+</p>
+<ol>
+	<li>Neither of the packets finds a confirmed <code>conntrack</code> in the <code>1. nf_conntrack_in step</code>. For both packets two <code>conntrack</code> entries with the same tuples are created.</li>
+	<li>Same as in the above case, but a <code>conntrack</code> entry of one of the packets is confirmed before the other has called <code>3. get_unique_tuple</code>. The other packet gets a different reply tuple usually with the source port changed.</li>
+	<li>Same as in the 1st case, but two different rules with different endpoints are selected in the step <code>2. ipt_do_table</code>.</li>
+</ol>
+<p>The outcome of the races is the same - one of the packets gets dropped in the step <code>5. __nf_conntrack_confirm</code>.
+</p>
+<p>This is exactly what happens in the DNS case. The GNU C Library and musl libc both perform A and AAAA DNS lookups in parallel. One of the UDP packets might get dropped by the kernel due to the races, so the client will try to re-send it after a timeout which is usually 5 seconds.
+</p>
+<p>It is worth mentioning that the problem is not only specific for Kubernetes - any Linux multi-threaded process sending UDP packets in parallel is prone to this race condition.
+</p>
+<p>Also, the 2nd race can happen even if you don't have any DNAT rules - it's enough to load the <code>nf_nat</code> kernel module to enable calls to <code>get_unique_tuple</code>.
+</p>
+<p>The <code>insert_failed</code> counter which can be obtained with <code>conntrack -S</code> is a good indicator whether you are experiencing the problem.
+</p>
+<h2>Mitigations
+</h2>
+<h3>Suggestions
+</h3>
+<p>There were many workarounds suggested: disable parallel lookups, disable IPv6 to avoid AAAA lookups, use TCP for lookups, set a real IP address of a DNS server in Pod's resolver configuration file instead, etc. See linked issues in the beginning of the post for more details. Unfortunately, many of them do not work due to limitations in musl libc used by a commonly used container base image Alpine Linux.
+</p>
+<p>The one which seems to reliably work for Weave Net users is to delay DNS packets with <a href="https://linux.die.net/man/8/tc">tc</a>. See <a href="https://blog.quentin-machu.fr/2018/06/24/5-15s-dns-lookups-on-kubernetes/">Quentin Machu's write-up</a> about it.
+</p>
+<p>Also, you might be wondering whether kube-proxy in the <code>ipvs</code> mode can bypass the problem. The answer is no, as <code>conntrack</code> is enabled in this mode as well. Also, when using the <code>rr</code> scheduler, the 3rd race can be easily reproduced in a cluster with low DNS traffic.
+</p>
+<h3>Kernel Fix
+</h3>
+<p>Regardless of the workarounds, I decided to fix the root causes in the kernel.
+</p>
+<p>The outcome is the following kernel patches:
+</p>
+<ol>
+	<li><a href="http://patchwork.ozlabs.org/patch/937963/">"netfilter: nf_conntrack: resolve clash for matching conntracks"</a> fixes the 1st race (accepted).</li>
+	<li><a href="http://patchwork.ozlabs.org/patch/952939/">"netfilter: nf_nat: return the same reply tuple for matching CTs"</a> fixes the 2nd race (waiting for a review).</li>
+</ol>
+<p>These two patches fix the problem for a cluster that runs only one instance of a DNS server, while reducing the timeout hit rate for the others.
+</p>
+<p>To completely eliminate the problem in all cases, the 3rd race needs to be addressed. One possible fix is to merge clashing <code>conntrack</code> entries with different destinations from the same socket in the step <code>5. __nf_conntrack_confirm</code>. However, this would invalidate a result of a previous iptables rules traversal for a packet of which the destination is changed in that step.
+</p>
+<p>Another possible solution is to run a DNS server instance on each node and make a Pod to query a DNS server running on a local node as suggested by my colleague <a href="https://github.com/kubernetes/kubernetes/issues/56903#issuecomment-410527887">here</a>.
+</p>
+<h2>Conclusions
+</h2>
+<p>First, I showed the underlying details of the "DNS lookup takes 5 seconds" problem and revealed the culprit - the Linux <code>conntrack</code> kernel module which is inherently racy. See <a href="https://tech.xing.com/a-reason-for-unexplained-connection-timeouts-on-kubernetes-docker-abd041cf7e02">this article</a> for other possible races in the module.
+</p>
+<p>Next, I presented the kernel fixes which eliminate two out of three relevant races in the module.
+</p>
+<p>Finally, I emphasized that, at the time of writing, the root cause is not completely fixed, and in some cases requires workarounds from users.
+</p>
+</body>
+</html>
