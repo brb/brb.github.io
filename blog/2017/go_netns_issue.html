@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>2017-05-30: Linux Namespaces and Go Don't Mix</title>
+</head>
+<body>
+<h1>2017-05-30: Linux Namespaces and Go Don't Mix</h1>
+<hr/>
+<em>This blog post was originally published on <a href="https://www.weave.works/blog/linux-namespaces-and-go-don-t-mix">weave.works</a></em>
+<p>This blog post is about an interesting bug which helped to reveal limitations of the Go programming language runtime.
+</p>
+<p>One day Alfonso from the Weave Scope team reported a mysterious bug in Weave Net: sometimes <code>weave ps</code> fails to list containers connected to the “weave” bridge with <code>Cannot find weave bridge: Link not found</code>. In other words, <code>weave ps</code> was not able to get information about the “weave” bridge network interface as it could not be found. Full bug report can be found <a href="https://github.com/weaveworks/weave/issues/2388">here</a>.
+</p>
+<h2>Background</h2>
+<p>Before going down the rabbit hole, a bit of context. Each container in Weave network is attached via virtual ethernet interface pair, or veth, to an L2 Linux software bridge on the same host which runs containers. An example of such configuration is shown below:
+</p>
+<p><img src="go_netns_issue.png">
+</p>
+<p>To list IPv4 addresses of local containers in the weave network, one can run <code>weave ps </code>which runs <a href="https://github.com/weaveworks/weave/blob/1.9/prog/weaveutil/main.go">weaveutil</a> in an external process. The latter is implemented in Go and in a simplified way does the following:</p>
+<pre><code>1: import (
+ 2:     "github.com/vishvananda/netlink"
+ 3:     "github.com/vishvananda/netns"
+ 4: )
+ 5:
+ 6: func main() {
+ 7:     for _, containerId := range os.Args[1:] {
+ 8:         containerAddr(containerID)
+ 9:     }
+10: }
+11:
+12: func containerAddr(containerIDs) {
+13:     containerPid := docker.GetPid(containerID)
+14:
+15:     bridge, err := netlink.LinkByName("weave")
+16:     if err != nil {
+17:         fmt.Fatalf("Cannot find weave bridge: %s", err)
+18:     }
+19:     indexes := getVethIndexesAttachedToBridge(bridge)
+20:
+21:     // Enter network namespace of the container
+22:     ns, _ := netns.GetFromPid(containerPid)
+23:     runtime.LockOSThread()
+24:     defer runtime.UnlockOSThread()
+25:     hostNetNs, _ := netns.Get()
+26:     netns.Set(ns)
+27:
+28:     links, _ := netlink.LinkList()
+29:     fmt.Println(filterAttachedLinks(links, indexes))
+30:
+31:     // Return to the host network namespace
+32:     netns.Set(hostNetNs)
+33: }</code></pre>
+<p>The <code>containerAddr</code> function retrieves the list of all network interfaces attached to the Weave bridge and enters the given container namespace to filter container network interfaces which are attached to the bridge.</p>
+<p>The failure happened at the line 15 which tries to get an information about the bridge via <a href="http://man7.org/linux/man-pages/man7/netlink.7.html">netlink</a>.
+</p>
+<p>The actual implementation of the affected version can be found <a href="https://github.com/weaveworks/weave/blob/v1.5.2/prog/weaveutil/addrs.go">here</a>.
+</p>
+<h2>Unsuccessful Debugging</h2>
+<p>Luckily after a bit of experimentation, I was able to quite reliable reproduce the bug by creating 100 dummy Docker containers and issuing <code>weave ps</code> multiple times:</p>
+<pre><code>$ for i in $(seq 1 100); do docker $(weave config) run -td alpine /bin/sh; done
+&lt;..&gt;
+$ for i in $(seq 1 10); do weave ps &gt;/dev/null; done
+Cannot find weave bridge: Link not found</code></pre>
+<p>First thing to check was whether the <code>weave</code> bridge interface under some circumstances did not actually exist, maybe it had been removed. However, inspecting the kernel log with <code>dmesg</code> showed that it did not happen.</p>
+<p>Next, the querying of network interfaces is handled by the Go <a href="https://github.com/vishvananda/netlink">netlink</a> library which, as the name suggests, communicates with the kernel via netlink interface. So the next step was to check for bugs in the library. Unfortunately, tracing communication between the kernel and <code>weaveutil</code>l via netlink socket with the handy <a href="https://github.com/socketpair/nltrace">nltrace</a> tool revealed nothing interesting, as the netlink request was valid, and the kernel returned that the “weave” interface was not found.
+</p>
+<h2>Revelation</h2>
+<p>The search for the cause was narrowed down to the implementation of weaveutil. As double checking the source code did not bring any success, I decided with the help of strace to see what happens in <code>weaveutil</code> from the Go runtime perspective (<a href="https://gist.github.com/brb/fb077d6f8e3ed3ebe40d5660edaecf70">full log</a>):</p>
+<pre><code>&lt;...&gt;
+1: [pid  3361] openat(AT_FDCWD, "/proc/17526/ns/net", O_RDONLY) = 61
+2: [pid  3361] getpid()                    = 3357
+3: [pid  3361] gettid()                    = 3361
+4: [pid  3361] openat(AT_FDCWD, "/proc/3357/task/3361/ns/net", O_RDONLY) = 62
+5: [pid  3361] setns(61, CLONE_NEWNET)     = 0
+&lt;...&gt;
+6: [pid  3361] socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) = 63
+7: [pid  3361] bind(63, {sa_family=AF_NETLINK, pid=0, groups=00000000}, 12) = 0
+8: [pid  3361] sendto(63, "\x20\x00\...", 32, 0, {sa_family=AF_NETLINK, pid=0, groups=00000000}, 12) = 32
+9: [pid  3361] getsockname(63, {sa_family=AF_NETLINK, pid=3357, groups=00000000}, [12]) = 0
+10: [pid  3361] futex(0xc820504110, FUTEX_WAKE, 1 &lt;unfinished ...&gt;
+11: [pid  3361] &lt;... futex resumed&gt; )       = 1
+12: [pid  3361] futex(0xd82930, FUTEX_WAKE, 1) = 1
+13: [pid  3361] futex(0xc820060110, FUTEX_WAIT, 0, NULL &lt;unfinished ...&gt;
+14: [pid  3361] &lt;... futex resumed&gt; )       = 0
+15: [pid  3361] recvfrom(63,  &lt;unfinished ...&gt;
+16: [pid  3361] &lt;... recvfrom resumed&gt; "\x4c\x00\...", 4096, 0, {sa_family=AF_NETLINK, pid=0, groups=00000000}, [12]) = 236
+&lt;...&gt;
+17: [pid  3361] clone( &lt;unfinished ...&gt;
+18: [pid  3361] &lt;... clone resumed&gt; child_stack=0x7f19efffee70, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, parent_tidptr=0x7f19effff9d0, tls=0x7f19effff700, child_tidptr=0x7f19effff9d0) = 3365
+&lt;...&gt;
+19: [pid  3361] setns(62, CLONE_NEWNET &lt;unfinished ...&gt;
+20: [pid  3361] &lt;... setns resumed&gt; )       = 0
+&lt;...&gt;
+21: [pid  3365] sendto(65, "\x2c\x00\...", 44, 0, {sa_family=AF_NETLINK, pid=0, groups=00000000}, 12) = 44
+22: [pid  3365] getsockname(65, {sa_family=AF_NETLINK, pid=3357, groups=00000000}, [12]) = 0
+23: [pid  3365] recvfrom(65, "\x40\x00\...", 4096, 0, {sa_family=AF_NETLINK, pid=0, groups=00000000}, [12]) = 64
+24: [pid  3365] close(65)                   = 0
+25: [pid  3365] write(2, "Cannot find weave bridge: Link not found\n", 41</code></pre>
+<p>First, a goroutine entered a network namespace (lines 1-5 in the strace log) of a container, which corresponds to lines 22-26 of the Go code above.
+</p>
+<p>Next, it received a list of the container network interfaces via netlink (lines 6-16), line 27 in the Go code.
+</p>
+<p>After <code>recvfrom</code> returned, the runtime created a new OS thread, PID 3365 (lines 17-18).
+</p>
+<p>Go implements concurrency by <a href="https://morsmachine.dk/go-scheduler">multiplexing goroutines onto OS threads</a>. So, to prevent from stalling a system when a goroutine issues a blocking syscall, the Go runtime might create a thread before entering or exiting the syscall. This was the case for <a href="http://man7.org/linux/man-pages/man2/clone.2.html">clone(2)</a> above.
+</p>
+<p>However, the runtime does not not pass the <code>CLONE_NEWNET</code> flag to <a href="https://github.com/golang/go/blob/release-branch.go1.5/src/runtime/os1_linux.go#L123">clone</a>. Therefore, the newly spawned thread ran in the same network namespace as the parent (PID 3361) did.
+</p>
+<p>As the parent returned to the host network namespace after <code>clone</code> took place (lines 19-20), the child ended up running in the container namespace.
+</p>
+<p>At some point the child was scheduled to run a goroutine which executed <code>containerAddr</code> function (lines 21-23 in the strace log). Because the <code>weave</code> bridge belonged to the host network namespace, and the child was in the container network namespace, obviously the bridge could not be found. This caused the error of the bug report.
+</p>
+<h2>Conclusions</h2>
+<p>This finding raised a question whether we can safely change a namespace in Go. Unfortunately, the answer is <a href="https://groups.google.com/d/topic/golang-nuts/ss1gEOcehjk/discussion">no</a>, as we do not have almost any control on scheduling goroutines.
+</p>
+<p>One could argue that locking a goroutine with <a href="https://golang.org/pkg/runtime/#LockOSThread">runtime.LockOSThread</a> could help, but a) the goroutine might spawn a new goroutine which would run in a wrong namespace b) locking does not prevent the runtime from creating a new OS thread for scheduling.
+</p>
+<p>In addition, it is not possible to guarantee that a new OS process implemented in Go and started from Go with <a href="https://golang.org/pkg/os/exec/">os/exec</a> will run in a given namespace. See <a href="https://groups.google.com/d/topic/golang-dev/6G4rq0DCKfo/discussion">discussion</a> for further details.
+</p>
+<p>Having all the limitation in mind, <a href="https://github.com/weaveworks/weave/blob/v1.8.2/net/netns.go#L64">the fix</a> to our problem is to execute every function which requires changing a namespace in a separate OS process. Execution happens via <a href="http://man7.org/linux/man-pages/man1/nsenter.1.html">nsenter</a> wrapper to make sure that all runtime threads are in the same namespace. Unfortunately, the fix introduces not only big penalties in performance, but also it makes our code less readable and less debuggable.
+</p>
+<p>Considering the discovered limitations, the vast adoption of Go within container software raises a few eyebrows.
+</body>
+</html>
