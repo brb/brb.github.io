@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>2018-03-08: Linux Namespaces and Go Started to Mix</title>
+</head>
+<body>
+  <h1>2018-03-08: Linux Namespaces and Go Started to Mix</h1>
+  <hr/>
+  <em>This blog post was originally published on <a href="https://www.weave.works/blog/linux-namespaces-golang-followup">weave.works</a></em>
+  <p>In this blog post, we will follow up the <a href="/blog/2017/go_netns_issue.html">"Linux Namespaces and Go Don't Mix"</a> post, and we will show how the problem mentioned in the previous post was resolved in the recent release of <a href="https://golang.org/doc/go1.10">Go 1.10</a>.
+</p>
+<h2>Problem</h2>
+<p>To recap, the main problem was that the Go runtime did not allow us to safely change a local state of an OS thread ("M" in the Go notation) scheduling a goroutine, even if the thread had been locked with <a href="https://golang.org/pkg/runtime/#LockOSThread">runtime.LockOSThread</a>.<br>The runtime could use the thread with the modified state to create a new thread which would inherit the state, and the new thread potentially would run any other goroutine resulting in an unexpected behaviour.<br><br>So, in our case, we could not safely change a network namespace from a goroutine. This was essential when configuring or listing container network interfaces via netlink in <a href="https://github.com/weaveworks/weave">Weave Net</a>.
+</p>
+<h2>Fix</h2>
+<p>Luckily, the post triggered some discussions which eventually led to a few relevant fixes to the Go runtime:<br><br>* <a href="https://github.com/golang/go/issues/20676">#20676</a>: No new thread will be created from a thread which is currently locked with runtime.LockOSThread.<br>* <a href="https://github.com/golang/go/issues/20395">#20395</a>: A locked thread will not be re-used to schedule other goroutines if a goroutine did not unlock it before exiting.<br>* <a href="https://github.com/golang/go/issues/20458">#20458</a>: If a thread was locked multiple times, runtime.UnlockOSThread has to be called equal number of times in order to unlock the thread.<br><br>All the fixes have been released with Go 1.10, and you can use the <code>// +build go1.10</code>&nbsp;constraint in your code to require the minimal version of Go to compile it.<br><br>Finally, we can get rid of <a href="https://github.com/weaveworks/weave/blob/v2.2.0/net/netns.go#L65">the ugly hack</a> in Weave Net which used to create a separate OS process just to execute a Go function in the given network namespace.
+</p>
+<h2>Gotchas</h2>
+<p>All this looks great. However, there is one gotcha. <code>runtime.LockOSThread</code> will not necessarily run a new goroutine spawned by a locked one on the same thread.
+</p>
+<p>To illustrate this behaviour, consider the following example:
+</p>
+<pre>// +build go1.10
+
+package main
+
+import (
+    "fmt"
+    "runtime"
+
+    "github.com/vishvananda/netns"
+)
+
+func main() {
+    ns, err := netns.New()
+    panicOnErr(err)
+
+    runtime.LockOSThread()
+    defer runtime.UnlockOSThread()
+
+    err = netns.Set(ns)
+    panicOnErr(err)
+
+    parentNetNS, err := netns.Get()
+    panicOnErr(err)
+    fmt.Println("parent:", parentNetNS)
+
+    wait := make(chan struct{})
+
+    go func() {
+        childNetNS, err := netns.Get()
+        panicOnErr(err)
+        fmt.Println("child:", childNetNS)
+
+        wait &lt;- struct{}{}
+    }()
+
+    &lt;-wait
+}
+
+func panicOnErr(err error) {
+    if err != nil {
+        panic(err)
+    }
+}
+</pre>
+<p>The output of the example program:&nbsp;
+</p>
+<pre>parent: NS(4: 3, 4026532486)
+child: NS(5: 3, 4026531993)
+</pre>
+<p>As you can see, the child goroutine ended up running in a different network namespace than the parent (the last number of each line in the output is the inode of the network namespace).<br><br>Therefore, <strong>do not spawn a new goroutine from a locked one if the new goroutine expected to be run on the same thread or a thread with the same modified state.</strong> This might become an issue when calling some library code from locked goroutines, as a developer might be unaware of whether the library internally spawns a goroutine. &nbsp;Detecting such unsafe cases could be a subject for a static analysis (hint: a relatively low hanging fruit).<br><br>Another thing to consider is possible performance penalties when exiting a locked goroutine without unlocking it. In such case, the runtime might create a new thread for scheduling goroutines which steals some CPU cycles from doing a useful job. Thus, if you strive for performance, do not forget to undo changes to a thread state and to unlock it, so that the runtime could re-use it.<br>
+</p>
+<h2>Conclusions</h2>
+<p dir="ltr">Go 1.10 introduced the fixes which make it more suitable for programming systems which are aware of an underlying OS. However, spawning a goroutine from a locked one requires great care.<br><br><em>Fewer eyebrows are raised.<br><br></em>
+</p>
+</body>
+</html>
