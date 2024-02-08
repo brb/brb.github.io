@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>2017-02-16: Fast Datapath Encryption in Weave Net</title>
+</head>
+<body>
+<h1>2017-02-16: Fast Datapath Encryption in Weave Net</h1>
+<hr/>
+<em>This blog post was originally published on <a href="https://www.weave.works/blog/weave-net-performance-fast-datapath">weave.works</a></em>
+
+ <p>Weave Net 1.2 introduced a high performance overlay network for containers called fast datapath (<a href="https://www.weave.works/docs/net/latest/using-weave/fastdp/">fastdp</a>). Despite advantages, the overlay had a limitation that it did not have any built-in mechanism for encrypting dataplane packets, so by default, it could not be securely used in untrusted networks. Today, this is no longer true, as we are announcing the release of Weave Net 1.9 which enables encryption in fast datapath, with measured throughput up to three times higher than the previous default overlay (sleeve).</p>
+<p>Enabling encryption in fast datapath is done in the same way as in sleeve: you need to specify a password when launching Weave Net, as described in <a href="https://www.weave.works/documentation/net-latest-using-weave/net-latest-security-untrusted-networks/">Securing Connections Across Untrusted Networks</a>.</p>
+<p>However, as fast datapath leverages the ESP protocol of IPsec (see Details section), please keep the following requirements and limitations in mind:</p>
+<ul>
+<li>The minimum required version of the Linux kernel is 4.2.</li>
+<li>In some networks, e.g. Google Cloud Platform, a firewall rule for enabling ESP traffic has to be installed.</li>
+<li>ESP adds 34-37 bytes overhead (the final MTU has to be divisible by four), therefore when setting a custom MTU for Weave Net, make sure that the MTU can accommodate the overhead. For instance, if MTU of a host public network interface is 1500, then the maximum MTU you can set on Weave Net is 1416 (50 bytes for the VXLAN overhead and 34 bytes for the ESP overhead). The default Weave Net’s MTU is 1376. See <a href="https://www.weave.works/docs/net/latest/using-weave/fastdp/">Using Fast Datapath</a> for more details.</li>
+<li>Same as in the unencrypted mode, encrypted fast datapath is not able to traverse NATs.</li>
+</ul>
+<p>If Weave Net is not able to establish encryption in fast datapath due to any of the requirements not being met, it will automatically fall back to the slower sleeve overlay in the encrypted mode. Thus, it guarantees that a traffic is always encrypted. To see which overlay is in use, you can run weave status connections command.</p>
+<h2>Details</h2>
+<p>Communication over the encrypted fast datapath has the following security properties:</p>
+<ul>
+<li>data confidentiality</li>
+<li>data origin authentication</li>
+<li>data integrity</li>
+<li>anti-replay</li>
+<li>limited traffic flow confidentiality as fast datapath VXLAN packets are fully encrypted</li>
+</ul>
+<p>The encryption feature is implemented using <a href="https://tools.ietf.org/html/rfc2406">the ESP protocol of IPsec</a>. Each fast datapath packet is authenticated and encrypted with <a href="https://tools.ietf.org/html/rfc4106">AES-GCM</a>, and encapsulated with ESP in the transport mode.</p>
+<p>Per each connection direction, a different AES-GCM 32-byte key and 4-byte salt are used. The pairs are derived with the HMAC-based Key Derivation Function (<a href="https://tools.ietf.org/html/rfc5869">HKDF</a>) by using SHA256 as the hashing algorithm, a 32-byte ephemeral session key which derivation is documented in <a href="https://www.weave.works/docs/net/latest/how-it-works/encryption-implementation/#ephemeral-key">Establishing the Ephemeral Session Key</a> as input keying material, a 32-byte randomly generated and exchanged over the encrypted control plane channel nonce, and a peer name as optional context.</p>
+<p>Packet integrity and authenticity of origin is protected with 16-byte Integrity Check Value which is included in each packet.<br>
+The structure of an encrypted fast datapath packet is shown below.</p>
+<p><img src="weave_fastdp_crypto_1.jpg" alt=""></p>
+<p>The decision to use AES-GCM is based on security requirements, and its performance characteristics. For Intel Architecture Processors, the Linux kernel implements the crypto algorithm by using special set of instructions which gives <a href="http://www.intel.co.uk/content/dam/www/public/us/en/documents/white-papers/aes-ipsec-performance-linux-paper.pdf">significant gains in performance</a>.</p>
+<p>By default, the ESP protocol implementation in the Linux kernel uses 4-byte Sequence Number (SeqNo) to protect against replay attacks. However, SeqNo’s of such size are prone to overflows in networks of large data volume and high throughput. To prevent it from happening, we use 8-byte Extended Sequence Number (<a href="https://tools.ietf.org/html/rfc4304">ESN</a>).<br>
+Security associations and policies are controlled by the Linux kernel IP transformation framework, or XFRM. During the development of the encryption feature, we discovered and fixed a <a href="https://patchwork.ozlabs.org/patch/713793/">bug in the kernel</a> which limits XFRM functionality for VXLAN tunneling.</p>
+<p>As the Linux kernel does not implement <a href="https://tools.ietf.org/html/draft-mcdonald-simple-ipsec-api-01)">IP Security API Extensions to BSD Sockets</a> to prevent from sending unencrypted traffic over secure channels, we install additional iptables rules. This is necessary as an end-user with administrator capabilities might accidentally modify the security associations.</p>
+<h2>Evaluation</h2>
+<p>To compare the performance of encryption in both overlays, we ran TCP throughput benchmarks with <a href="https://iperf.fr/">iperf3</a> between two Amazon EC2 c3.8xlarge instances connected with enhanced 10 Gigabit networking. Each instance was running Ubuntu 16.04 LTS. Exact steps for running&nbsp;bechmarks can be found <a href="https://github.com/weaveworks/weave/blob/5b060634427f4e65ad1873ef9871f94f04b4486a/docs/benchmarks.md#2017-02-16-fast-datapath-encryption">here</a>.</p>
+<p>The results are shown below. Firstly, encrypted fast datapath outperformed encrypted sleeve by factor of three – because our combination of VXLAN and IPsec stays in the kernel and does not incur the overhead of user-space processing. Secondly, the encryption implementation in fast datapath does not introduce any significant overhead when comparing its throughput with the throughput measured between two hosts communicating over the IPsec protected channel.</p>
+<p><img src="weave_fastdp_crypto_2.jpg" alt=""></p>
+<p>Additionally, we evaluated <a href="https://tools.ietf.org/html/rfc7539">Chacha20,Poly1305</a> as an alternative crypto suite for fast datapath. The achieved throughput was 2.88 Gbits/s which is lower than the one of AES-GCM, therefore we decided to use the latter.</p>
+<h2>Summary</h2>
+<p>We presented the encryption feature in fast datapath which enables fast and secure communication among containers.The conducted benchmarks shows that the throughput of the encrypted fast datapath is three times higher than the throughput of the encrypted sleeve, and its performance is very close to IPsec on hosts communicating without overlays.</p>
+<p><a href="https://www.weave.works/weave-net-1-9-released-encrypted-fast-datapath-arm/" target="_blank">Read more about the Weave Net 1.9 release here</a>.</p>
+</body>
+</html>
